@@ -1,0 +1,109 @@
+name: PlanA AI Check
+on:
+  repository_dispatch:
+    types: [check_task] # match 'event_type' in Laravel code
+
+jobs:
+  run-ai:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. get the source code in repo
+      - name: Get sourcekode
+        uses: actions/checkout@v5
+
+      # 2. Setup Python to run analysis
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # 3. Run AI-analysis against Gemini
+      - name: Analysis task against code
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TASK_ID: ${{ github.event.client_payload.task_id }}
+          TASK_TEXT: ${{ github.event.client_payload.task_text }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+        run: |
+          python - << 'EOF'
+          import os, json, urllib.request
+
+          print("--- 1. start script ---")
+
+          api_key = os.environ["GEMINI_API_KEY"]
+          task_id = os.environ["TASK_ID"]
+          task_text = os.environ["TASK_TEXT"]
+          callback = os.environ["CALLBACK_URL"]
+
+          print("f## env ##")
+          print(f"# api_key {api_key}")
+          print(f"# task_id {task_id}")
+          print(f"# task_text {task_text}")
+          print(f"# callback {callback}")
+          
+          if not api_key:
+            print("Error: GEMINI_API_KEY missing in GitHub Secrets!")
+            exit(1)
+
+          print(f"--- 2. ANALYSERER OPGAVE ID {task_id} ---")
+
+          # Pickup a project file list ( for context )
+          file_list = []
+          for root, dirs, files in os.walk("."):
+              if ".git" in root or "node_modules" in root or "vendor" in root:
+                  continue
+              for f in files:
+                  file_list.append(os.path.join(root, f))
+          
+          code_summary = ", ".join(file_list[:50]) # Tager de første 50 filer som eksempel
+
+          # Build the Gemini prompt
+          prompt = f"""
+          Du er en senior software-arkitekt.
+          En bruger har skrevet følgende opgave til en udvikler:
+          "{task_text}"
+
+          Projektets filstruktur ser således ud:
+          {code_summary}
+
+          Vurder om opgaveteksten er klar, forståelig og giver mening i forhold til projektet.
+          Svar kort med:
+          1. En status (GODKENDT, UTLAR, eller FEJL)
+          2. En kort begrundelse på 2-3 sætninger.
+          """
+
+          print("--- 3. SENDER TIL GEMINI API ---")
+
+          # Call Gemini API
+          # old url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+          url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+          headers = {"Content-Type": "application/json"}
+          data = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
+
+          try:
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as response:
+              res = json.loads(response.read().decode())
+              ai_answer = res["candidates"][0]["content"]["parts"][0]["text"]
+              print("--- 4. MODTOG SVAR FRA GEMINI ---")
+              print(ai_answer)
+          except Exception as e:
+              print(f"ERROR in Gemini call: {e}")
+              exit(1)
+
+          # Send result back to caller
+          result_data = json.dumps({
+              "task_id": task_id,
+              "result": ai_answer
+          }).encode("utf-8")
+
+          try:
+            req_back = urllib.request.Request(callback, data=result_data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req_back) as resp:
+              print(f"--- 6. Callback status: {resp.status} ---")
+          except Exception as e:
+              print(f"ERROR on callback: {e}")
+              exit(1)
+
+          print("--- MISSION FULLFØRT ---")
+          EOF
